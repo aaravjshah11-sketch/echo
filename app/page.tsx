@@ -8,11 +8,21 @@ import {
   useSyncExternalStore,
 } from "react";
 
-type Status = "idle" | "recording" | "done";
+type Status = "idle" | "recording" | "done" | "transcribing";
+
+type Transcript = {
+  text: string;
+  duration: number | null;
+  wordCount: number;
+};
 
 const RECORD_SECONDS = 30;
 const DONE_SECONDS = 3;
+const TRANSCRIPT_SECONDS = 10;
+const TRANSCRIPT_ERROR_SECONDS = 4;
 const ENCOURAGEMENT_EVERY = 5;
+
+const TRANSCRIPT_ERROR_MESSAGE = "Transcription unavailable — recording saved";
 
 const PROMPTS = [
   "Tell me about your morning.",
@@ -44,9 +54,26 @@ const MIME_CANDIDATES = [
   "audio/ogg;codecs=opus",
 ];
 
+// Whisper rejects files whose extension it doesn't recognise, so the upload
+// filename has to track whatever the browser actually recorded.
+const EXTENSION_BY_MIME: Record<string, string> = {
+  "audio/webm": "webm",
+  "audio/ogg": "ogg",
+  "audio/opus": "opus",
+  "audio/mp4": "mp4",
+  "audio/x-m4a": "m4a",
+  "audio/mpeg": "mp3",
+  "audio/wav": "wav",
+};
+
 function pickMimeType(): string | undefined {
   if (typeof MediaRecorder === "undefined") return undefined;
   return MIME_CANDIDATES.find((type) => MediaRecorder.isTypeSupported(type));
+}
+
+function uploadFilename(mimeType: string): string {
+  const baseMime = mimeType.split(";")[0].trim().toLowerCase();
+  return `echo.${EXTENSION_BY_MIME[baseMime] ?? "webm"}`;
 }
 
 // Same starting prompt all day, so a check-in feels like a daily ritual rather
@@ -75,6 +102,8 @@ export default function Home() {
   const [promptsAdvanced, setPromptsAdvanced] = useState(0);
   const [isStarting, setIsStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [transcript, setTranscript] = useState<Transcript | null>(null);
+  const [transcriptError, setTranscriptError] = useState<string | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -102,14 +131,58 @@ export default function Home() {
     };
   }, []);
 
+  const transcribe = useCallback(async (blob: Blob) => {
+    setTranscript(null);
+    setTranscriptError(null);
+
+    try {
+      const body = new FormData();
+      body.append("audio", blob, uploadFilename(blob.type));
+
+      const response = await fetch("/api/transcribe", { method: "POST", body });
+      const payload = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        throw new Error(
+          payload?.error ?? `Transcription failed (${response.status})`,
+        );
+      }
+
+      const text = typeof payload?.text === "string" ? payload.text.trim() : "";
+      const duration = Number(payload?.duration);
+      // Word-level timestamps give an exact count; fall back to splitting the
+      // text if Groq ever omits them.
+      const wordCount = Array.isArray(payload?.words)
+        ? payload.words.length
+        : text
+          ? text.split(/\s+/).filter(Boolean).length
+          : 0;
+
+      if (mountedRef.current) {
+        setTranscript({
+          text,
+          duration: Number.isFinite(duration) ? duration : null,
+          wordCount,
+        });
+      }
+    } catch (err) {
+      console.error("[Echo] transcription failed", err);
+      if (mountedRef.current) setTranscriptError(TRANSCRIPT_ERROR_MESSAGE);
+    }
+  }, []);
+
   const stopRecording = useCallback(() => {
     const recorder = recorderRef.current;
     if (recorder && recorder.state !== "inactive") {
-      // The onstop handler assembles the blob and moves us to "done".
+      // The onstop handler assembles the blob, sends it off, and moves us to
+      // "done".
       recorder.stop();
       return;
     }
     releaseStream();
+    // No recorder means no audio to send — make sure the transcribing state
+    // still has something to resolve on.
+    setTranscriptError(TRANSCRIPT_ERROR_MESSAGE);
     setStatus("done");
   }, [releaseStream]);
 
@@ -158,6 +231,9 @@ export default function Home() {
         });
         releaseStream();
         recorderRef.current = null;
+        // Start transcribing immediately so the thank-you doubles as loading
+        // time rather than adding to it.
+        void transcribe(blob);
         if (mountedRef.current) setStatus("done");
       };
 
@@ -184,7 +260,7 @@ export default function Home() {
     } finally {
       if (mountedRef.current) setIsStarting(false);
     }
-  }, [releaseStream]);
+  }, [releaseStream, transcribe]);
 
   // Tick the countdown while recording.
   useEffect(() => {
@@ -200,16 +276,29 @@ export default function Home() {
     if (status === "recording" && secondsLeft === 0) stopRecording();
   }, [status, secondsLeft, stopRecording]);
 
-  // Hold the thank-you, then reset with the next prompt in the rotation.
+  // Hold the thank-you, then hand over to the transcript.
   useEffect(() => {
     if (status !== "done") return;
+    const id = setTimeout(() => setStatus("transcribing"), DONE_SECONDS * 1000);
+    return () => clearTimeout(id);
+  }, [status]);
+
+  // Let the transcript (or its failure) sit for a beat, then start fresh.
+  useEffect(() => {
+    if (status !== "transcribing") return;
+    const settled = transcript !== null || transcriptError !== null;
+    if (!settled) return;
+
+    const hold = transcriptError ? TRANSCRIPT_ERROR_SECONDS : TRANSCRIPT_SECONDS;
     const id = setTimeout(() => {
       setPromptsAdvanced((advanced) => advanced + 1);
       setSecondsLeft(RECORD_SECONDS);
+      setTranscript(null);
+      setTranscriptError(null);
       setStatus("idle");
-    }, DONE_SECONDS * 1000);
+    }, hold * 1000);
     return () => clearTimeout(id);
-  }, [status]);
+  }, [status, transcript, transcriptError]);
 
   const promptIndex = (startingPrompt + promptsAdvanced) % PROMPTS.length;
   const elapsed = RECORD_SECONDS - secondsLeft;
@@ -217,6 +306,9 @@ export default function Home() {
     ENCOURAGEMENTS[
       Math.floor(elapsed / ENCOURAGEMENT_EVERY) % ENCOURAGEMENTS.length
     ];
+
+  const isWaitingForTranscript =
+    status === "transcribing" && transcript === null && transcriptError === null;
 
   const buttonBase =
     "relative z-10 flex h-[200px] w-[200px] touch-manipulation select-none flex-col items-center justify-center gap-3 text-xl font-medium transition-transform duration-200 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-offset-4 focus-visible:ring-offset-[#FAF7F2] dark:focus-visible:ring-offset-[#141210] disabled:opacity-70";
@@ -250,12 +342,32 @@ export default function Home() {
             Thank you. See you tomorrow.
           </p>
         )}
+
+        {status === "transcribing" && (
+          <p
+            className="text-[1.75rem] leading-snug font-medium text-balance"
+            aria-live="polite"
+          >
+            {isWaitingForTranscript
+              ? "Turning your words into text..."
+              : transcript
+                ? "Here's what I heard."
+                : "Thank you. See you tomorrow."}
+          </p>
+        )}
       </div>
 
       <div className="relative flex items-center justify-center">
         {status === "recording" && (
           <span
             className="pointer-events-none absolute -inset-5 animate-pulse rounded-[4rem] bg-[#C0483C]/20 motion-reduce:animate-none"
+            aria-hidden="true"
+          />
+        )}
+
+        {isWaitingForTranscript && (
+          <span
+            className="pointer-events-none absolute -inset-5 animate-pulse rounded-full bg-[#2E2A27]/12 motion-reduce:animate-none dark:bg-white/12"
             aria-hidden="true"
           />
         )}
@@ -288,9 +400,9 @@ export default function Home() {
           </button>
         )}
 
-        {status === "done" && (
+        {(status === "done" || status === "transcribing") && (
           <div
-            className="flex h-[200px] w-[200px] items-center justify-center rounded-full bg-[#2E2A27]/8 text-[#2E2A27] dark:bg-white/10 dark:text-[#F3EEE8]"
+            className="relative z-10 flex h-[200px] w-[200px] items-center justify-center rounded-full bg-[#2E2A27]/8 text-[#2E2A27] dark:bg-white/10 dark:text-[#F3EEE8]"
             aria-hidden="true"
           >
             <CheckIcon />
@@ -298,8 +410,14 @@ export default function Home() {
         )}
       </div>
 
-      {/* Supporting line — also height-reserved to keep the layout still. */}
-      <div className="flex min-h-[7rem] w-full max-w-md flex-col items-center gap-4 text-center">
+      {/* Supporting line and transcript — the slot grows the moment we enter
+          the transcribing state, so the panel fills space already reserved
+          instead of shoving the button upward when it arrives. */}
+      <div
+        className={`flex w-full max-w-md flex-col items-center gap-4 text-center transition-[min-height] duration-500 ease-out ${
+          status === "transcribing" ? "min-h-[17rem]" : "min-h-[7rem]"
+        }`}
+      >
         {status === "idle" && !error && (
           <p className="text-lg leading-relaxed text-stone-500 dark:text-stone-400">
             Take 30 seconds — no need to think about it.
@@ -312,6 +430,38 @@ export default function Home() {
             aria-live="polite"
           >
             {encouragement}
+          </p>
+        )}
+
+        {status === "transcribing" && transcript && (
+          <div className="w-full">
+            <div className="mb-3 flex items-center justify-center gap-4 text-lg text-stone-500 dark:text-stone-400">
+              <span>
+                {transcript.duration === null
+                  ? "—"
+                  : `${Math.round(transcript.duration)} seconds`}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span>
+                {transcript.wordCount}{" "}
+                {transcript.wordCount === 1 ? "word" : "words"}
+              </span>
+            </div>
+            <p
+              className="max-h-52 overflow-y-auto rounded-3xl bg-[#F1EBE2] px-6 py-5 text-left font-mono text-lg leading-relaxed text-stone-600 dark:bg-[#211D19] dark:text-stone-300"
+              aria-live="polite"
+            >
+              {transcript.text || "No words picked up this time."}
+            </p>
+          </div>
+        )}
+
+        {status === "transcribing" && transcriptError && (
+          <p
+            className="rounded-3xl bg-[#F1EBE2] px-6 py-5 text-lg leading-relaxed text-stone-500 dark:bg-[#211D19] dark:text-stone-400"
+            aria-live="polite"
+          >
+            {transcriptError}
           </p>
         )}
 
