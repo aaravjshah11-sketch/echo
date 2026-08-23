@@ -10,10 +10,19 @@ import {
 
 type Status = "idle" | "recording" | "done" | "transcribing";
 
+type Signals = {
+  content_word_pause_avg_ms: number;
+  filled_pause_rate_per_min: number;
+  repetition_rate_per_min: number;
+  speech_rate_wpm: number;
+  word_finding_score: number;
+};
+
 type Transcript = {
   text: string;
   duration: number | null;
   wordCount: number;
+  signals: Signals | null;
 };
 
 const RECORD_SECONDS = 30;
@@ -74,6 +83,31 @@ function pickMimeType(): string | undefined {
 function uploadFilename(mimeType: string): string {
   const baseMime = mimeType.split(";")[0].trim().toLowerCase();
   return `echo.${EXTENSION_BY_MIME[baseMime] ?? "webm"}`;
+}
+
+// Signal 01 grades from calm to concerned. Tints stay inside the warm palette
+// so a high score reads as "worth noticing", never as an alarm.
+function scoreTint(score: number): string {
+  if (score < 20) return "bg-[#E8EFE5] dark:bg-[#1C241A]";
+  if (score <= 50) return "bg-[#F0E8D0] dark:bg-[#282211]";
+  if (score <= 80) return "bg-[#F0DCC0] dark:bg-[#2C1E10]";
+  return "bg-[#E8CCC5] dark:bg-[#2E1A15]";
+}
+
+function parseSignals(raw: unknown): Signals | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  const read = (key: keyof Signals): number => {
+    const parsed = Number(value[key]);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  return {
+    content_word_pause_avg_ms: read("content_word_pause_avg_ms"),
+    filled_pause_rate_per_min: read("filled_pause_rate_per_min"),
+    repetition_rate_per_min: read("repetition_rate_per_min"),
+    speech_rate_wpm: read("speech_rate_wpm"),
+    word_finding_score: read("word_finding_score"),
+  };
 }
 
 // Same starting prompt all day, so a check-in feels like a daily ritual rather
@@ -163,6 +197,7 @@ export default function Home() {
           text,
           duration: Number.isFinite(duration) ? duration : null,
           wordCount,
+          signals: parseSignals(payload?.signals),
         });
       }
     } catch (err) {
@@ -415,7 +450,7 @@ export default function Home() {
           instead of shoving the button upward when it arrives. */}
       <div
         className={`flex w-full max-w-md flex-col items-center gap-4 text-center transition-[min-height] duration-500 ease-out ${
-          status === "transcribing" ? "min-h-[17rem]" : "min-h-[7rem]"
+          status === "transcribing" ? "min-h-[21rem]" : "min-h-[7rem]"
         }`}
       >
         {status === "idle" && !error && (
@@ -434,7 +469,9 @@ export default function Home() {
         )}
 
         {status === "transcribing" && transcript && (
-          <div className="w-full">
+          // Scrolls within the reserved slot, so a long transcript or a wrapped
+          // tile row can never push the button around.
+          <div className="max-h-[21rem] w-full overflow-y-auto">
             <div className="mb-3 flex items-center justify-center gap-4 text-lg text-stone-500 dark:text-stone-400">
               <span>
                 {transcript.duration === null
@@ -447,8 +484,18 @@ export default function Home() {
                 {transcript.wordCount === 1 ? "word" : "words"}
               </span>
             </div>
+
+            {transcript.signals && (
+              <div className="mb-3">
+                <p className="mb-2 text-xs tracking-[0.14em] text-stone-400 uppercase dark:text-stone-500">
+                  Signals
+                </p>
+                <SignalTiles signals={transcript.signals} />
+              </div>
+            )}
+
             <p
-              className="max-h-52 overflow-y-auto rounded-3xl bg-[#F1EBE2] px-6 py-5 text-left font-mono text-lg leading-relaxed text-stone-600 dark:bg-[#211D19] dark:text-stone-300"
+              className="rounded-3xl bg-[#F1EBE2] px-6 py-5 text-left font-mono text-lg leading-relaxed text-stone-600 dark:bg-[#211D19] dark:text-stone-300"
               aria-live="polite"
             >
               {transcript.text || "No words picked up this time."}
@@ -475,6 +522,56 @@ export default function Home() {
         )}
       </div>
     </main>
+  );
+}
+
+function SignalTiles({ signals }: { signals: Signals }) {
+  const tiles = [
+    {
+      label: "Pause ms",
+      value: String(signals.content_word_pause_avg_ms),
+      tint: "bg-[#F1EBE2] dark:bg-[#211D19]",
+    },
+    {
+      label: "Um/min",
+      value: signals.filled_pause_rate_per_min.toFixed(1),
+      tint: "bg-[#F1EBE2] dark:bg-[#211D19]",
+    },
+    {
+      label: "Repeat/min",
+      value: signals.repetition_rate_per_min.toFixed(1),
+      tint: "bg-[#F1EBE2] dark:bg-[#211D19]",
+    },
+    {
+      label: "WPM",
+      value: String(signals.speech_rate_wpm),
+      tint: "bg-[#F1EBE2] dark:bg-[#211D19]",
+    },
+    {
+      label: "Score",
+      value: String(signals.word_finding_score),
+      tint: scoreTint(signals.word_finding_score),
+    },
+  ];
+
+  return (
+    // Three across on a phone, all five on wider screens. Grid rows stretch,
+    // so a label that wraps to two lines keeps every tile the same height.
+    <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
+      {tiles.map((tile) => (
+        <div
+          key={tile.label}
+          className={`flex flex-col items-center justify-center gap-1 rounded-2xl px-2 py-3 ${tile.tint}`}
+        >
+          <span className="font-mono text-2xl tabular-nums text-stone-700 dark:text-stone-200">
+            {tile.value}
+          </span>
+          <span className="text-center text-xs leading-tight tracking-[0.1em] text-stone-500 uppercase dark:text-stone-400">
+            {tile.label}
+          </span>
+        </div>
+      ))}
+    </div>
   );
 }
 
